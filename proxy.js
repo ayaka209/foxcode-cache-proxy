@@ -14,8 +14,11 @@ import { createServer } from 'http';
 const CONFIG = {
   port: parseInt(process.env.PROXY_PORT || '18800'),
   targetHost: process.env.TARGET_HOST || 'code.newcli.com',
-  targetPath: process.env.TARGET_PATH || '/claude/droid/v1/messages',
   userId: process.env.USER_ID || 'clawdbot-user',
+  
+  // 支持的渠道列表
+  channels: ['droid', 'aws', 'super', 'ultra'],
+  defaultChannel: 'droid',
   
   // 重试配置
   retry: {
@@ -39,7 +42,8 @@ const log = {
 
 log.info('Foxcode Cache Proxy starting...');
 log.info(`Port: ${CONFIG.port}`);
-log.info(`Target: https://${CONFIG.targetHost}${CONFIG.targetPath}`);
+log.info(`Target Host: https://${CONFIG.targetHost}`);
+log.info(`Channels: ${CONFIG.channels.join(', ')}`);
 log.info(`User ID: ${CONFIG.userId}`);
 log.info(`Retry: max=${CONFIG.retry.maxAttempts}, delay=${CONFIG.retry.initialDelayMs}ms`);
 
@@ -60,12 +64,27 @@ function isRetryableError(error) {
          error.message?.includes('network');
 }
 
+// 从请求路径解析渠道
+function parseChannel(url) {
+  // 支持格式: /droid/v1/messages, /aws/v1/messages 等
+  const match = url.match(/^\/([^\/]+)/);
+  if (match && CONFIG.channels.includes(match[1])) {
+    return match[1];
+  }
+  return CONFIG.defaultChannel;
+}
+
+// 构建目标URL
+function buildTargetUrl(channel) {
+  return `https://${CONFIG.targetHost}/claude/${channel}/v1/messages`;
+}
+
 // ============ 请求处理 ============
 async function handleRequest(req, res) {
   // 健康检查端点
   if (req.url === '/health' && req.method === 'GET') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok', timestamp: Date.now() }));
+    res.end(JSON.stringify({ status: 'ok', channels: CONFIG.channels, timestamp: Date.now() }));
     return;
   }
 
@@ -75,6 +94,10 @@ async function handleRequest(req, res) {
     res.end(JSON.stringify({ error: 'Method Not Allowed' }));
     return;
   }
+
+  // 解析渠道
+  const channel = parseChannel(req.url);
+  const targetUrl = buildTargetUrl(channel);
 
   try {
     // 读取请求体
@@ -88,13 +111,13 @@ async function handleRequest(req, res) {
     const data = JSON.parse(body);
     data.metadata = { ...data.metadata, user_id: CONFIG.userId };
     
-    log.request(`model=${data.model}, messages=${data.messages?.length || 0}`);
+    log.request(`[${channel}] model=${data.model}, messages=${data.messages?.length || 0}`);
     
     // 带重试的转发
-    await forwardWithRetry(data, req.headers, res);
+    await forwardWithRetry(data, req.headers, res, targetUrl, channel);
     
   } catch (err) {
-    log.error(`Request failed: ${err.message}`);
+    log.error(`[${channel}] Request failed: ${err.message}`);
     if (!res.headersSent) {
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: err.message }));
@@ -103,18 +126,18 @@ async function handleRequest(req, res) {
 }
 
 // ============ 带重试的转发 ============
-async function forwardWithRetry(data, headers, res) {
+async function forwardWithRetry(data, headers, res, targetUrl, channel) {
   let lastError;
   
   for (let attempt = 0; attempt < CONFIG.retry.maxAttempts; attempt++) {
     try {
       if (attempt > 0) {
         const delay = getRetryDelay(attempt - 1);
-        log.info(`Retry attempt ${attempt}/${CONFIG.retry.maxAttempts} after ${delay}ms`);
+        log.info(`[${channel}] Retry attempt ${attempt}/${CONFIG.retry.maxAttempts} after ${delay}ms`);
         await sleep(delay);
       }
       
-      await forwardRequest(data, headers, res);
+      await forwardRequest(data, headers, res, targetUrl, channel);
       return; // 成功则返回
       
     } catch (err) {
@@ -124,7 +147,7 @@ async function forwardWithRetry(data, headers, res) {
         throw err;
       }
       
-      log.error(`Attempt ${attempt + 1} failed: ${err.message}`);
+      log.error(`[${channel}] Attempt ${attempt + 1} failed: ${err.message}`);
     }
   }
   
@@ -132,8 +155,7 @@ async function forwardWithRetry(data, headers, res) {
 }
 
 // ============ 转发请求 ============
-async function forwardRequest(data, headers, res) {
-  const targetUrl = `https://${CONFIG.targetHost}${CONFIG.targetPath}`;
+async function forwardRequest(data, headers, res, targetUrl, channel) {
   const body = JSON.stringify(data);
   
   const controller = new AbortController();
@@ -168,7 +190,7 @@ async function forwardRequest(data, headers, res) {
     }
     res.end();
     
-    log.response(`${response.status}`);
+    log.response(`[${channel}] ${response.status}`);
     
   } finally {
     clearTimeout(timeout);
@@ -186,6 +208,8 @@ server.on('error', (err) => {
 server.listen(CONFIG.port, '127.0.0.1', () => {
   log.success(`Proxy ready at http://127.0.0.1:${CONFIG.port}`);
   log.info(`Health check: http://127.0.0.1:${CONFIG.port}/health`);
+  log.info(`Usage: POST /{channel}/v1/messages`);
+  log.info(`  Channels: ${CONFIG.channels.join(', ')}`);
 });
 
 // 优雅退出
