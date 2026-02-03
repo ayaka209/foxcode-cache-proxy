@@ -352,7 +352,7 @@ async function forwardClaude(data, headers, res, targetUrl) {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': headers.authorization,
+        'Authorization': headers.authorization || headers["x-api-key"],
         'anthropic-version': headers['anthropic-version'] || '2023-06-01',
         'anthropic-beta': headers['anthropic-beta'] || '',
       },
